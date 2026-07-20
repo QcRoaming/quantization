@@ -580,7 +580,7 @@ __global__ void combine_results(
 }
 ```
 
-### GPTQ量化过程：
+### GPTQ量化过程
 
 离线量化：GPTQ使用一小批校准数据，让模型运行若干次，记录各个 Linear 层的输入，它利用这些输入估计：哪些输入通道更重要，哪些权重列之间相关，某个权重量化产生的误差会怎样影响输出，然后逐列量化，首先计算当前列量化误差，然后把误差补偿（Hessian）到未量化列，然后继续量化下一列。量化后的 Linear 层通常保存四类数据：qweight：低比特整数权重，通常打包到INT32中，scales：每组权重的缩放因子，qzeros：每组权重的零点，g_idx：每个输入通道使用哪一组scale和zero。在torch后端，也就是GPTQModel 的 Torch 路径在反量化后会把权重转换到输入 `x.dtype`(激活值类型：经过 Embedding 层以后产生的浮点 `hidden_states`的数据类型，而这个类型可以由模型初始化阶段指定，如果要对GPTQ量化后的模型推理，模型初始化阶段一般指定fp16/bf16，如果指定fp32根据不同的后端，要么报错，要么自动转换成fp16 )，随后调用 `torch.matmul`。之后的源码整理也是torch后端。每个后端执行矩阵乘的时候权重都会反量化回 x.dtype
 
@@ -646,3 +646,4 @@ GPTQConfig(
 )
 ```
 
+pip install -U gptqmodel datasets
