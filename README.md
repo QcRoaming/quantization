@@ -580,3 +580,69 @@ __global__ void combine_results(
 }
 ```
 
+### GPTQ量化过程：
+
+离线量化：GPTQ使用一小批校准数据，让模型运行若干次，记录各个 Linear 层的输入，它利用这些输入估计：哪些输入通道更重要，哪些权重列之间相关，某个权重量化产生的误差会怎样影响输出，然后逐列量化，首先计算当前列量化误差，然后把误差补偿（Hessian）到未量化列，然后继续量化下一列。量化后的 Linear 层通常保存四类数据：qweight：低比特整数权重，通常打包到INT32中，scales：每组权重的缩放因子，qzeros：每组权重的零点，g_idx：每个输入通道使用哪一组scale和zero。在torch后端，也就是GPTQModel 的 Torch 路径在反量化后会把权重转换到输入 `x.dtype`(激活值类型：经过 Embedding 层以后产生的浮点 `hidden_states`的数据类型，而这个类型可以由模型初始化阶段指定，如果要对GPTQ量化后的模型推理，模型初始化阶段一般指定fp16/bf16，如果指定fp32根据不同的后端，要么报错，要么自动转换成fp16 )，随后调用 `torch.matmul`。之后的源码整理也是torch后端。每个后端执行矩阵乘的时候权重都会反量化回 x.dtype
+
+torch后端源码：
+
+```python
+# 1. 从打包的 int32 中解出 INT4 权重
+weight_int = (qweight >> shifts) & 0xF
+
+# 2. 解出每个量化组对应的 zero
+zeros = (qzeros >> shifts) & 0xF
+
+# 3. 根据 g_idx，为每个输入通道选择对应的 scale 和 zero
+group_ids = g_idx.long()
+
+scale = scales[group_ids]
+zero = zeros[group_ids]
+
+# 4. 反量化
+# 常见做法：先用 FP32 计算，再转换为 activation 的 dtype
+weight = scale.float() * (
+    weight_int.float() - zero.float()
+)
+
+weight = weight.to(x.dtype)
+
+# 5. 矩阵乘
+output = x @ weight
+
+# 6. 加 bias
+if bias is not None:
+    output = output + bias.to(output.dtype)
+```
+
+GPTQ量化中常用参数：
+
+- **bits**
+  指定权重量化位数，例如 `4` 表示将权重量化为 INT4。
+- **group_size**
+  指定多少个连续权重共享一组 `scale` 和 `zero-point`。数值越小，量化粒度越细，但量化参数更多。
+- **desc_act**
+  是否根据激活重要程度重新排列权重列的量化顺序。开启后通常有利于精度，但可能影响推理速度和后端兼容性。
+- **true_sequential**
+  是否按照模型真实执行顺序逐层量化。开启后，后面的层会使用前面已经量化后的输出，更接近最终推理状态。
+- **sym**
+  是否采用对称量化。`True` 表示量化范围以 0 为中心；`False` 表示使用带 zero-point 的非对称量化。
+- **damp_percent**
+  对 GPTQ 使用的 Hessian 矩阵增加阻尼，避免矩阵求逆或分解时数值不稳定。
+- **dataset**
+  指定校准数据。GPTQ使用这些数据收集模型各层的输入激活，并据此判断不同权重的量化敏感度。
+
+最常见的配置形式大致是：
+
+```python
+GPTQConfig(
+    bits=4,
+    group_size=128,
+    desc_act=False,
+    true_sequential=True,
+    sym=True,
+    damp_percent=0.1,
+    dataset=calibration_data,
+)
+```
+
